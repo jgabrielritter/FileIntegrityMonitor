@@ -1,0 +1,13 @@
+{
+    "baseline_file": "baseline.json",
+    "hash_algorithm": "sha256",
+    "scan_interval": 3600,
+    "monitored_paths": [],
+    "excluded_paths": [],
+    "excluded_extensions": [
+        ".tmp",
+        ".log",
+        ".bak"
+    ],
+    "alert_command": null
+}

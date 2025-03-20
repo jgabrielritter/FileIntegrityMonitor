@@ -1,403 +1,1116 @@
 #!/usr/bin/env python3
 """
-File Integrity Monitor
+File Integrity Monitor GUI
 
-This script monitors files and directories for unauthorized changes by comparing
-hash values of files against a baseline.
+A graphical user interface for the File Integrity Monitor tool.
 """
 
 import os
 import sys
 import json
 import time
-import hashlib
-import argparse
-import logging
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import threading
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+import logging
+import queue
 
-# Configure logging
+# Import the FileIntegrityMonitor class
+try:
+    from file_integrity_monitor import FileIntegrityMonitor
+except ImportError:
+    # If running as standalone, include the class here
+    from typing import Dict, List, Tuple, Optional
+    import hashlib
+
+    class FileIntegrityMonitor:
+        """
+        A class to monitor file integrity using hash comparisons.
+        """
+        
+        def __init__(self, config_file: str = "fim_config.json"):
+            """
+            Initialize the File Integrity Monitor.
+            
+            Args:
+                config_file: Path to the configuration file.
+            """
+            self.config_file = config_file
+            self.config = self._load_config()
+            self.baseline_file = self.config.get("baseline_file", "baseline.json")
+            self.baseline = self._load_baseline()
+            
+        def _load_config(self) -> Dict:
+            """
+            Load configuration from the config file.
+            
+            Returns:
+                Dict: Configuration settings.
+            """
+            try:
+                if os.path.exists(self.config_file):
+                    with open(self.config_file, 'r') as f:
+                        return json.load(f)
+                else:
+                    # Default configuration
+                    default_config = {
+                        "baseline_file": "baseline.json",
+                        "hash_algorithm": "sha256",
+                        "scan_interval": 3600,  # 1 hour
+                        "monitored_paths": [],
+                        "excluded_paths": [],
+                        "excluded_extensions": [".tmp", ".log", ".bak"],
+                        "alert_command": None
+                    }
+                    with open(self.config_file, 'w') as f:
+                        json.dump(default_config, f, indent=4)
+                    return default_config
+            except Exception as e:
+                logging.error(f"Error loading configuration: {e}")
+                return {}
+        
+        def _load_baseline(self) -> Dict:
+            """
+            Load the baseline hashes from the baseline file.
+            
+            Returns:
+                Dict: Baseline file hashes.
+            """
+            if os.path.exists(self.baseline_file):
+                try:
+                    with open(self.baseline_file, 'r') as f:
+                        return json.load(f)
+                except Exception as e:
+                    logging.error(f"Error loading baseline: {e}")
+                    return {}
+            return {}
+        
+        def _save_baseline(self) -> None:
+            """Save the current baseline to the baseline file."""
+            try:
+                with open(self.baseline_file, 'w') as f:
+                    json.dump(self.baseline, f, indent=4)
+            except Exception as e:
+                logging.error(f"Error saving baseline: {e}")
+        
+        def _calculate_file_hash(self, file_path: str) -> str:
+            """
+            Calculate the hash of a file.
+            
+            Args:
+                file_path: Path to the file.
+                
+            Returns:
+                str: Hash value of the file.
+            """
+            hash_algorithm = self.config.get("hash_algorithm", "sha256")
+            hash_func = hashlib.new(hash_algorithm)
+            
+            try:
+                with open(file_path, 'rb') as f:
+                    # Read the file in chunks to handle large files
+                    for chunk in iter(lambda: f.read(4096), b''):
+                        hash_func.update(chunk)
+                return hash_func.hexdigest()
+            except Exception as e:
+                logging.error(f"Error calculating hash for {file_path}: {e}")
+                return ""
+        
+        def _get_file_metadata(self, file_path: str) -> Dict:
+            """
+            Get file metadata.
+            
+            Args:
+                file_path: Path to the file.
+                
+            Returns:
+                Dict: File metadata.
+            """
+            try:
+                stat_info = os.stat(file_path)
+                return {
+                    "size": stat_info.st_size,
+                    "permissions": stat_info.st_mode,
+                    "owner": stat_info.st_uid,
+                    "group": stat_info.st_gid,
+                    "last_modified": stat_info.st_mtime,
+                    "last_accessed": stat_info.st_atime
+                }
+            except Exception as e:
+                logging.error(f"Error getting metadata for {file_path}: {e}")
+                return {}
+        
+        def _should_monitor_file(self, file_path: str) -> bool:
+            """
+            Check if a file should be monitored based on exclusion rules.
+            
+            Args:
+                file_path: Path to the file.
+                
+            Returns:
+                bool: True if the file should be monitored, False otherwise.
+            """
+            # Check excluded paths
+            for excluded_path in self.config.get("excluded_paths", []):
+                if file_path.startswith(excluded_path):
+                    return False
+            
+            # Check excluded extensions
+            _, extension = os.path.splitext(file_path)
+            if extension in self.config.get("excluded_extensions", []):
+                return False
+                
+            return True
+        
+        def create_baseline(self) -> None:
+            """Create a baseline of file hashes for all monitored paths."""
+            monitored_paths = self.config.get("monitored_paths", [])
+            if not monitored_paths:
+                logging.error("No monitored paths specified in configuration")
+                return
+            
+            new_baseline = {}
+            file_count = 0
+            
+            for path in monitored_paths:
+                if not os.path.exists(path):
+                    logging.warning(f"Monitored path does not exist: {path}")
+                    continue
+                    
+                if os.path.isfile(path):
+                    if self._should_monitor_file(path):
+                        file_hash = self._calculate_file_hash(path)
+                        if file_hash:
+                            new_baseline[path] = {
+                                "hash": file_hash,
+                                "metadata": self._get_file_metadata(path),
+                                "baseline_date": datetime.now().isoformat()
+                            }
+                            file_count += 1
+                else:
+                    # Walk through directories
+                    for root, _, files in os.walk(path):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            if self._should_monitor_file(file_path):
+                                file_hash = self._calculate_file_hash(file_path)
+                                if file_hash:
+                                    new_baseline[file_path] = {
+                                        "hash": file_hash,
+                                        "metadata": self._get_file_metadata(file_path),
+                                        "baseline_date": datetime.now().isoformat()
+                                    }
+                                    file_count += 1
+            
+            self.baseline = new_baseline
+            self._save_baseline()
+            logging.info(f"Created baseline with {file_count} files")
+            return file_count
+        
+        def check_integrity(self) -> List[Dict]:
+            """
+            Check the integrity of files against the baseline.
+            
+            Returns:
+                List[Dict]: List of changes detected.
+            """
+            if not self.baseline:
+                logging.error("No baseline available. Create a baseline first.")
+                return []
+            
+            changes = []
+            
+            # Check existing files against baseline
+            for file_path, baseline_data in self.baseline.items():
+                if not os.path.exists(file_path):
+                    changes.append({
+                        "file": file_path,
+                        "type": "deleted",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    continue
+                    
+                current_hash = self._calculate_file_hash(file_path)
+                if not current_hash:
+                    continue
+                    
+                if current_hash != baseline_data["hash"]:
+                    changes.append({
+                        "file": file_path,
+                        "type": "modified",
+                        "old_hash": baseline_data["hash"],
+                        "new_hash": current_hash,
+                        "timestamp": datetime.now().isoformat()
+                    })
+            
+            # Check for new files
+            monitored_paths = self.config.get("monitored_paths", [])
+            for path in monitored_paths:
+                if not os.path.exists(path):
+                    continue
+                    
+                if os.path.isfile(path):
+                    if path not in self.baseline and self._should_monitor_file(path):
+                        changes.append({
+                            "file": path,
+                            "type": "new",
+                            "hash": self._calculate_file_hash(path),
+                            "timestamp": datetime.now().isoformat()
+                        })
+                else:
+                    # Walk through directories
+                    for root, _, files in os.walk(path):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            if file_path not in self.baseline and self._should_monitor_file(file_path):
+                                changes.append({
+                                    "file": file_path,
+                                    "type": "new",
+                                    "hash": self._calculate_file_hash(file_path),
+                                    "timestamp": datetime.now().isoformat()
+                                })
+            
+            return changes
+        
+        def update_baseline(self, file_path: Optional[str] = None) -> None:
+            """
+            Update the baseline for a specific file or all files if not specified.
+            
+            Args:
+                file_path: Path to the file to update, or None to update all files.
+            """
+            if file_path:
+                if os.path.exists(file_path) and self._should_monitor_file(file_path):
+                    file_hash = self._calculate_file_hash(file_path)
+                    if file_hash:
+                        self.baseline[file_path] = {
+                            "hash": file_hash,
+                            "metadata": self._get_file_metadata(file_path),
+                            "baseline_date": datetime.now().isoformat()
+                        }
+                        self._save_baseline()
+                else:
+                    logging.error(f"Cannot update baseline for {file_path}: File does not exist or is excluded")
+            else:
+                # Update baseline for all existing files
+                return self.create_baseline()
+
+
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("fim.log"),
+        logging.FileHandler("fim_gui.log"),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger(__name__)
 
-class FileIntegrityMonitor:
-    """
-    A class to monitor file integrity using hash comparisons.
-    """
+class FIMApplication(tk.Tk):
+    """Main application window for the File Integrity Monitor GUI."""
     
-    def __init__(self, config_file: str = "fim_config.json"):
-        """
-        Initialize the File Integrity Monitor.
+    def __init__(self):
+        super().__init__()
         
-        Args:
-            config_file: Path to the configuration file.
-        """
-        self.config_file = config_file
-        self.config = self._load_config()
-        self.baseline_file = self.config.get("baseline_file", "baseline.json")
-        self.baseline = self._load_baseline()
+        self.title("File Integrity Monitor")
+        self.geometry("900x600")
+        self.minsize(800, 500)
         
-    def _load_config(self) -> Dict:
-        """
-        Load configuration from the config file.
+        # Set up the queue for thread communication
+        self.queue = queue.Queue()
         
-        Returns:
-            Dict: Configuration settings.
-        """
-        try:
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    return json.load(f)
-            else:
-                # Default configuration
-                default_config = {
-                    "baseline_file": "baseline.json",
-                    "hash_algorithm": "sha256",
-                    "scan_interval": 3600,  # 1 hour
-                    "monitored_paths": [],
-                    "excluded_paths": [],
-                    "excluded_extensions": [".tmp", ".log", ".bak"],
-                    "alert_command": None
-                }
-                with open(self.config_file, 'w') as f:
-                    json.dump(default_config, f, indent=4)
-                logger.info(f"Created default configuration file: {self.config_file}")
-                return default_config
-        except Exception as e:
-            logger.error(f"Error loading configuration: {e}")
-            sys.exit(1)
+        # Create the main frame
+        self.main_frame = ttk.Frame(self)
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Initialize the monitor
+        self.fim = FileIntegrityMonitor()
+        
+        # Configure the main frame with widgets
+        self._create_widgets()
+        
+        # Initialize variables
+        self.monitor_thread = None
+        self.monitor_running = False
+        self.last_check_time = None
+        
+        # Load configuration
+        self._load_config_to_ui()
+        
+        # Start the queue processing
+        self.process_queue()
     
-    def _load_baseline(self) -> Dict:
-        """
-        Load the baseline hashes from the baseline file.
+    def _create_widgets(self):
+        """Create all the widgets for the application."""
+        # Create a notebook for tabs
+        self.notebook = ttk.Notebook(self.main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
         
-        Returns:
-            Dict: Baseline file hashes.
-        """
-        if os.path.exists(self.baseline_file):
+        # Create tabs
+        self.dashboard_tab = ttk.Frame(self.notebook)
+        self.config_tab = ttk.Frame(self.notebook)
+        self.logs_tab = ttk.Frame(self.notebook)
+        
+        self.notebook.add(self.dashboard_tab, text="Dashboard")
+        self.notebook.add(self.config_tab, text="Configuration")
+        self.notebook.add(self.logs_tab, text="Logs")
+        
+        # Set up each tab
+        self._setup_dashboard()
+        self._setup_config()
+        self._setup_logs()
+    
+    def _setup_dashboard(self):
+        """Set up the dashboard tab."""
+        # Create frames for organization
+        status_frame = ttk.LabelFrame(self.dashboard_tab, text="Status")
+        status_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        actions_frame = ttk.LabelFrame(self.dashboard_tab, text="Actions")
+        actions_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        results_frame = ttk.LabelFrame(self.dashboard_tab, text="Results")
+        results_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Status frame widgets
+        status_grid = ttk.Frame(status_frame)
+        status_grid.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(status_grid, text="Baseline Status:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
+        self.baseline_status = ttk.Label(status_grid, text="Not Created")
+        self.baseline_status.grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(status_grid, text="Files Monitored:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        self.files_monitored = ttk.Label(status_grid, text="0")
+        self.files_monitored.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(status_grid, text="Last Check:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
+        self.last_check = ttk.Label(status_grid, text="Never")
+        self.last_check.grid(row=2, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(status_grid, text="Monitoring Status:").grid(row=0, column=2, sticky=tk.W, padx=5, pady=2)
+        self.monitor_status = ttk.Label(status_grid, text="Stopped")
+        self.monitor_status.grid(row=0, column=3, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(status_grid, text="Scan Interval:").grid(row=1, column=2, sticky=tk.W, padx=5, pady=2)
+        self.scan_interval_label = ttk.Label(status_grid, text="3600 seconds")
+        self.scan_interval_label.grid(row=1, column=3, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(status_grid, text="Next Scan:").grid(row=2, column=2, sticky=tk.W, padx=5, pady=2)
+        self.next_scan = ttk.Label(status_grid, text="N/A")
+        self.next_scan.grid(row=2, column=3, sticky=tk.W, padx=5, pady=2)
+        
+        # Actions frame widgets
+        actions_grid = ttk.Frame(actions_frame)
+        actions_grid.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.create_baseline_btn = ttk.Button(actions_grid, text="Create Baseline", command=self.create_baseline)
+        self.create_baseline_btn.grid(row=0, column=0, padx=5, pady=5)
+        
+        self.check_integrity_btn = ttk.Button(actions_grid, text="Check Integrity", command=self.check_integrity)
+        self.check_integrity_btn.grid(row=0, column=1, padx=5, pady=5)
+        
+        self.update_baseline_btn = ttk.Button(actions_grid, text="Update Baseline", command=self.update_baseline)
+        self.update_baseline_btn.grid(row=0, column=2, padx=5, pady=5)
+        
+        self.monitor_btn = ttk.Button(actions_grid, text="Start Monitoring", command=self.toggle_monitoring)
+        self.monitor_btn.grid(row=0, column=3, padx=5, pady=5)
+        
+        # Results frame widgets
+        results_grid = ttk.Frame(results_frame)
+        results_grid.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Create a treeview for results
+        self.result_tree = ttk.Treeview(results_grid, columns=("type", "file", "timestamp"), show="headings")
+        self.result_tree.heading("type", text="Change Type")
+        self.result_tree.heading("file", text="File Path")
+        self.result_tree.heading("timestamp", text="Timestamp")
+        
+        self.result_tree.column("type", width=100)
+        self.result_tree.column("file", width=500)
+        self.result_tree.column("timestamp", width=150)
+        
+        self.result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Add scrollbar to the treeview
+        scrollbar = ttk.Scrollbar(results_grid, orient=tk.VERTICAL, command=self.result_tree.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.result_tree.configure(yscrollcommand=scrollbar.set)
+        
+        # Bind double-click event to show details
+        self.result_tree.bind("<Double-1>", self.show_change_details)
+        
+        # Update the baseline status
+        self._update_baseline_status()
+    
+    def _setup_config(self):
+        """Set up the configuration tab."""
+        # Create frames for different config sections
+        general_frame = ttk.LabelFrame(self.config_tab, text="General Settings")
+        general_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        paths_frame = ttk.LabelFrame(self.config_tab, text="Monitored Paths")
+        paths_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        exclude_frame = ttk.LabelFrame(self.config_tab, text="Exclusions")
+        exclude_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # General Settings
+        general_grid = ttk.Frame(general_frame)
+        general_grid.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(general_grid, text="Hash Algorithm:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
+        self.hash_algorithm = tk.StringVar(value="sha256")
+        hash_options = ["md5", "sha1", "sha256", "sha512"]
+        hash_dropdown = ttk.Combobox(general_grid, textvariable=self.hash_algorithm, values=hash_options, state="readonly")
+        hash_dropdown.grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(general_grid, text="Scan Interval (seconds):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        self.scan_interval = tk.StringVar(value="3600")
+        scan_entry = ttk.Entry(general_grid, textvariable=self.scan_interval, width=10)
+        scan_entry.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(general_grid, text="Baseline File:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
+        self.baseline_file = tk.StringVar(value="baseline.json")
+        baseline_entry = ttk.Entry(general_grid, textvariable=self.baseline_file, width=30)
+        baseline_entry.grid(row=2, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(general_grid, text="Alert Command:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=2)
+        self.alert_command = tk.StringVar(value="")
+        alert_entry = ttk.Entry(general_grid, textvariable=self.alert_command, width=30)
+        alert_entry.grid(row=3, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        # Monitored Paths
+        paths_grid = ttk.Frame(paths_frame)
+        paths_grid.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Create a listbox for monitored paths
+        self.paths_listbox = tk.Listbox(paths_grid, height=5, width=50)
+        self.paths_listbox.grid(row=0, column=0, rowspan=4, sticky=tk.W+tk.E+tk.N+tk.S, padx=5, pady=5)
+        
+        # Add scrollbar to the listbox
+        paths_scrollbar = ttk.Scrollbar(paths_grid, orient=tk.VERTICAL, command=self.paths_listbox.yview)
+        paths_scrollbar.grid(row=0, column=1, rowspan=4, sticky=tk.N+tk.S)
+        self.paths_listbox.configure(yscrollcommand=paths_scrollbar.set)
+        
+        # Buttons for managing paths
+        self.add_path_btn = ttk.Button(paths_grid, text="Add Path", command=self.add_monitored_path)
+        self.add_path_btn.grid(row=0, column=2, sticky=tk.W, padx=5, pady=2)
+        
+        self.remove_path_btn = ttk.Button(paths_grid, text="Remove Path", command=self.remove_monitored_path)
+        self.remove_path_btn.grid(row=1, column=2, sticky=tk.W, padx=5, pady=2)
+        
+        # Exclusions
+        exclude_grid = ttk.Frame(exclude_frame)
+        exclude_grid.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Create a tab for exclusions
+        exclude_notebook = ttk.Notebook(exclude_grid)
+        exclude_notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # Create tabs for different exclusion types
+        exclude_paths_tab = ttk.Frame(exclude_notebook)
+        exclude_extensions_tab = ttk.Frame(exclude_notebook)
+        
+        exclude_notebook.add(exclude_paths_tab, text="Excluded Paths")
+        exclude_notebook.add(exclude_extensions_tab, text="Excluded Extensions")
+        
+        # Excluded Paths
+        self.excluded_paths_listbox = tk.Listbox(exclude_paths_tab, height=5, width=50)
+        self.excluded_paths_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        excluded_paths_scrollbar = ttk.Scrollbar(exclude_paths_tab, orient=tk.VERTICAL, command=self.excluded_paths_listbox.yview)
+        excluded_paths_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.excluded_paths_listbox.configure(yscrollcommand=excluded_paths_scrollbar.set)
+        
+        excluded_paths_buttons = ttk.Frame(exclude_paths_tab)
+        excluded_paths_buttons.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
+        
+        self.add_excluded_path_btn = ttk.Button(excluded_paths_buttons, text="Add", command=self.add_excluded_path)
+        self.add_excluded_path_btn.pack(fill=tk.X, padx=5, pady=2)
+        
+        self.remove_excluded_path_btn = ttk.Button(excluded_paths_buttons, text="Remove", command=self.remove_excluded_path)
+        self.remove_excluded_path_btn.pack(fill=tk.X, padx=5, pady=2)
+        
+        # Excluded Extensions
+        excluded_extensions_frame = ttk.Frame(exclude_extensions_tab)
+        excluded_extensions_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.excluded_extensions_listbox = tk.Listbox(excluded_extensions_frame, height=5, width=20)
+        self.excluded_extensions_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        excluded_extensions_scrollbar = ttk.Scrollbar(excluded_extensions_frame, orient=tk.VERTICAL, command=self.excluded_extensions_listbox.yview)
+        excluded_extensions_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.excluded_extensions_listbox.configure(yscrollcommand=excluded_extensions_scrollbar.set)
+        
+        excluded_extensions_buttons = ttk.Frame(exclude_extensions_tab)
+        excluded_extensions_buttons.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
+        
+        self.extension_entry = ttk.Entry(excluded_extensions_buttons, width=10)
+        self.extension_entry.pack(fill=tk.X, padx=5, pady=2)
+        
+        self.add_extension_btn = ttk.Button(excluded_extensions_buttons, text="Add", command=self.add_excluded_extension)
+        self.add_extension_btn.pack(fill=tk.X, padx=5, pady=2)
+        
+        self.remove_extension_btn = ttk.Button(excluded_extensions_buttons, text="Remove", command=self.remove_excluded_extension)
+        self.remove_extension_btn.pack(fill=tk.X, padx=5, pady=2)
+        
+        # Save button
+        save_frame = ttk.Frame(self.config_tab)
+        save_frame.pack(fill=tk.X, padx=5, pady=10)
+        
+        self.save_config_btn = ttk.Button(save_frame, text="Save Configuration", command=self.save_configuration)
+        self.save_config_btn.pack(side=tk.RIGHT, padx=5, pady=5)
+    
+    def _setup_logs(self):
+        """Set up the logs tab."""
+        # Create a scrolled text widget for logs
+        self.log_text = scrolledtext.ScrolledText(self.logs_tab, wrap=tk.WORD, width=80, height=20)
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.log_text.configure(state="disabled")
+        
+        # Create buttons for log management
+        log_button_frame = ttk.Frame(self.logs_tab)
+        log_button_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.clear_logs_btn = ttk.Button(log_button_frame, text="Clear Logs", command=self.clear_logs)
+        self.clear_logs_btn.pack(side=tk.RIGHT, padx=5, pady=5)
+        
+        self.refresh_logs_btn = ttk.Button(log_button_frame, text="Refresh Logs", command=self.refresh_logs)
+        self.refresh_logs_btn.pack(side=tk.RIGHT, padx=5, pady=5)
+        
+        # Load logs
+        self.refresh_logs()
+    
+    def _load_config_to_ui(self):
+        """Load configuration from the FIM object to the UI."""
+        # Load general settings
+        self.hash_algorithm.set(self.fim.config.get("hash_algorithm", "sha256"))
+        self.scan_interval.set(str(self.fim.config.get("scan_interval", 3600)))
+        self.baseline_file.set(self.fim.config.get("baseline_file", "baseline.json"))
+        self.alert_command.set(self.fim.config.get("alert_command", ""))
+        
+        # Load monitored paths
+        self.paths_listbox.delete(0, tk.END)
+        for path in self.fim.config.get("monitored_paths", []):
+            self.paths_listbox.insert(tk.END, path)
+        
+        # Load excluded paths
+        self.excluded_paths_listbox.delete(0, tk.END)
+        for path in self.fim.config.get("excluded_paths", []):
+            self.excluded_paths_listbox.insert(tk.END, path)
+        
+        # Load excluded extensions
+        self.excluded_extensions_listbox.delete(0, tk.END)
+        for ext in self.fim.config.get("excluded_extensions", []):
+            self.excluded_extensions_listbox.insert(tk.END, ext)
+        
+        # Update the scan interval label
+        self.scan_interval_label.config(text=f"{self.fim.config.get('scan_interval', 3600)} seconds")
+    
+    def _update_baseline_status(self):
+        """Update the baseline status in the UI."""
+        if self.fim.baseline:
+            self.baseline_status.config(text="Created")
+            self.files_monitored.config(text=str(len(self.fim.baseline)))
+        else:
+            self.baseline_status.config(text="Not Created")
+            self.files_monitored.config(text="0")
+    
+    def create_baseline(self):
+        """Create a baseline for the monitored files."""
+        # Check if monitored paths are configured
+        if not self.fim.config.get("monitored_paths", []):
+            messagebox.showerror("Error", "No monitored paths configured. Please add paths in the Configuration tab.")
+            return
+        
+        # Create a progress window
+        progress_window = tk.Toplevel(self)
+        progress_window.title("Creating Baseline")
+        progress_window.geometry("300x100")
+        progress_window.transient(self)
+        progress_window.grab_set()
+        
+        ttk.Label(progress_window, text="Creating baseline. This may take a while...").pack(pady=10)
+        progress_bar = ttk.Progressbar(progress_window, mode="indeterminate")
+        progress_bar.pack(fill=tk.X, padx=20, pady=10)
+        progress_bar.start()
+        
+        # Create the baseline in a separate thread
+        def create_baseline_thread():
             try:
-                with open(self.baseline_file, 'r') as f:
-                    return json.load(f)
+                file_count = self.fim.create_baseline()
+                self.queue.put(("update_baseline", file_count))
             except Exception as e:
-                logger.error(f"Error loading baseline: {e}")
-                return {}
-        return {}
-    
-    def _save_baseline(self) -> None:
-        """Save the current baseline to the baseline file."""
-        try:
-            with open(self.baseline_file, 'w') as f:
-                json.dump(self.baseline, f, indent=4)
-            logger.info(f"Baseline saved to {self.baseline_file}")
-        except Exception as e:
-            logger.error(f"Error saving baseline: {e}")
-    
-    def _calculate_file_hash(self, file_path: str) -> str:
-        """
-        Calculate the hash of a file.
+                self.queue.put(("error", str(e)))
+            finally:
+                self.queue.put(("close_progress", None))
         
-        Args:
-            file_path: Path to the file.
-            
-        Returns:
-            str: Hash value of the file.
-        """
-        hash_algorithm = self.config.get("hash_algorithm", "sha256")
-        hash_func = hashlib.new(hash_algorithm)
+        thread = threading.Thread(target=create_baseline_thread)
+        thread.daemon = True
+        thread.start()
         
-        try:
-            with open(file_path, 'rb') as f:
-                # Read the file in chunks to handle large files
-                for chunk in iter(lambda: f.read(4096), b''):
-                    hash_func.update(chunk)
-            return hash_func.hexdigest()
-        except Exception as e:
-            logger.error(f"Error calculating hash for {file_path}: {e}")
-            return ""
+        # Update the UI when baseline creation is complete
+        def check_queue():
+            try:
+                message, data = self.queue.get(block=False)
+                if message == "update_baseline":
+                    self._update_baseline_status()
+                    progress_window.destroy()
+                    messagebox.showinfo("Success", f"Baseline created successfully with {data} files.")
+                elif message == "error":
+                    progress_window.destroy()
+                    messagebox.showerror("Error", f"Error creating baseline: {data}")
+                elif message == "close_progress":
+                    progress_window.destroy()
+            except queue.Empty:
+                progress_window.after(100, check_queue)
+        
+        check_queue()
     
-    def _get_file_metadata(self, file_path: str) -> Dict:
-        """
-        Get file metadata.
-        
-        Args:
-            file_path: Path to the file.
-            
-        Returns:
-            Dict: File metadata.
-        """
-        try:
-            stat_info = os.stat(file_path)
-            return {
-                "size": stat_info.st_size,
-                "permissions": stat_info.st_mode,
-                "owner": stat_info.st_uid,
-                "group": stat_info.st_gid,
-                "last_modified": stat_info.st_mtime,
-                "last_accessed": stat_info.st_atime
-            }
-        except Exception as e:
-            logger.error(f"Error getting metadata for {file_path}: {e}")
-            return {}
-    
-    def _should_monitor_file(self, file_path: str) -> bool:
-        """
-        Check if a file should be monitored based on exclusion rules.
-        
-        Args:
-            file_path: Path to the file.
-            
-        Returns:
-            bool: True if the file should be monitored, False otherwise.
-        """
-        # Check excluded paths
-        for excluded_path in self.config.get("excluded_paths", []):
-            if file_path.startswith(excluded_path):
-                return False
-        
-        # Check excluded extensions
-        _, extension = os.path.splitext(file_path)
-        if extension in self.config.get("excluded_extensions", []):
-            return False
-            
-        return True
-    
-    def create_baseline(self) -> None:
-        """Create a baseline of file hashes for all monitored paths."""
-        monitored_paths = self.config.get("monitored_paths", [])
-        if not monitored_paths:
-            logger.error("No monitored paths specified in configuration")
+    def check_integrity(self):
+        """Check integrity of files against the baseline."""
+        # Check if baseline exists
+        if not self.fim.baseline:
+            messagebox.showerror("Error", "No baseline exists. Please create a baseline first.")
             return
         
-        new_baseline = {}
-        file_count = 0
+        # Create a progress window
+        progress_window = tk.Toplevel(self)
+        progress_window.title("Checking Integrity")
+        progress_window.geometry("300x100")
+        progress_window.transient(self)
+        progress_window.grab_set()
         
-        for path in monitored_paths:
-            if not os.path.exists(path):
-                logger.warning(f"Monitored path does not exist: {path}")
-                continue
-                
-            if os.path.isfile(path):
-                if self._should_monitor_file(path):
-                    file_hash = self._calculate_file_hash(path)
-                    if file_hash:
-                        new_baseline[path] = {
-                            "hash": file_hash,
-                            "metadata": self._get_file_metadata(path),
-                            "baseline_date": datetime.now().isoformat()
-                        }
-                        file_count += 1
-            else:
-                # Walk through directories
-                for root, _, files in os.walk(path):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if self._should_monitor_file(file_path):
-                            file_hash = self._calculate_file_hash(file_path)
-                            if file_hash:
-                                new_baseline[file_path] = {
-                                    "hash": file_hash,
-                                    "metadata": self._get_file_metadata(file_path),
-                                    "baseline_date": datetime.now().isoformat()
-                                }
-                                file_count += 1
+        ttk.Label(progress_window, text="Checking file integrity. Please wait...").pack(pady=10)
+        progress_bar = ttk.Progressbar(progress_window, mode="indeterminate")
+        progress_bar.pack(fill=tk.X, padx=20, pady=10)
+        progress_bar.start()
         
-        self.baseline = new_baseline
-        self._save_baseline()
-        logger.info(f"Created baseline with {file_count} files")
+        # Check integrity in a separate thread
+        def check_integrity_thread():
+            try:
+                changes = self.fim.check_integrity()
+                self.queue.put(("update_results", changes))
+            except Exception as e:
+                self.queue.put(("error", str(e)))
+            finally:
+                self.queue.put(("close_progress", None))
+        
+        thread = threading.Thread(target=check_integrity_thread)
+        thread.daemon = True
+        thread.start()
+        
+        # Update the UI when check is complete
+        def check_queue():
+            try:
+                message, data = self.queue.get(block=False)
+                if message == "update_results":
+                    progress_window.destroy()
+                    self._display_results(data)
+                    self.last_check_time = datetime.now()
+                    self.last_check.config(text=self.last_check_time.strftime("%Y-%m-%d %H:%M:%S"))
+                    if not data:
+                        messagebox.showinfo("Integrity Check", "No changes detected.")
+                elif message == "error":
+                    progress_window.destroy()
+                    messagebox.showerror("Error", f"Error checking integrity: {data}")
+                elif message == "close_progress":
+                    progress_window.destroy()
+            except queue.Empty:
+                progress_window.after(100, check_queue)
+        
+        check_queue()
     
-    def check_integrity(self) -> List[Dict]:
-        """
-        Check the integrity of files against the baseline.
-        
-        Returns:
-            List[Dict]: List of changes detected.
-        """
-        if not self.baseline:
-            logger.error("No baseline available. Create a baseline first.")
-            return []
-        
-        changes = []
-        
-        # Check existing files against baseline
-        for file_path, baseline_data in self.baseline.items():
-            if not os.path.exists(file_path):
-                changes.append({
-                    "file": file_path,
-                    "type": "deleted",
-                    "timestamp": datetime.now().isoformat()
-                })
-                continue
-                
-            current_hash = self._calculate_file_hash(file_path)
-            if not current_hash:
-                continue
-                
-            if current_hash != baseline_data["hash"]:
-                changes.append({
-                    "file": file_path,
-                    "type": "modified",
-                    "old_hash": baseline_data["hash"],
-                    "new_hash": current_hash,
-                    "timestamp": datetime.now().isoformat()
-                })
-        
-        # Check for new files
-        monitored_paths = self.config.get("monitored_paths", [])
-        for path in monitored_paths:
-            if not os.path.exists(path):
-                continue
-                
-            if os.path.isfile(path):
-                if path not in self.baseline and self._should_monitor_file(path):
-                    changes.append({
-                        "file": path,
-                        "type": "new",
-                        "hash": self._calculate_file_hash(path),
-                        "timestamp": datetime.now().isoformat()
-                    })
-            else:
-                # Walk through directories
-                for root, _, files in os.walk(path):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if file_path not in self.baseline and self._should_monitor_file(file_path):
-                            changes.append({
-                                "file": file_path,
-                                "type": "new",
-                                "hash": self._calculate_file_hash(file_path),
-                                "timestamp": datetime.now().isoformat()
-                            })
-        
-        return changes
-    
-    def handle_changes(self, changes: List[Dict]) -> None:
-        """
-        Handle detected changes.
-        
-        Args:
-            changes: List of changes detected.
-        """
-        if not changes:
-            logger.info("No changes detected")
+    def update_baseline(self):
+        """Update the baseline with current files."""
+        if not self.fim.baseline:
+            messagebox.showerror("Error", "No baseline exists. Please create a baseline first.")
             return
+        
+        if messagebox.askyesno("Update Baseline", "Are you sure you want to update the baseline with the current state of all files?"):
+            # Create a progress window
+            progress_window = tk.Toplevel(self)
+            progress_window.title("Updating Baseline")
+            progress_window.geometry("300x100")
+            progress_window.transient(self)
+            progress_window.grab_set()
             
-        logger.warning(f"Detected {len(changes)} changes:")
+            ttk.Label(progress_window, text="Updating baseline. This may take a while...").pack(pady=10)
+            progress_bar = ttk.Progressbar(progress_window, mode="indeterminate")
+            progress_bar.pack(fill=tk.X, padx=20, pady=10)
+            progress_bar.start()
+            
+            # Update baseline in a separate thread
+            def update_baseline_thread():
+                try:
+                    file_count = self.fim.update_baseline()
+                    self.queue.put(("update_baseline", file_count))
+                except Exception as e:
+                    self.queue.put(("error", str(e)))
+                finally:
+                    self.queue.put(("close_progress", None))
+            
+            thread = threading.Thread(target=update_baseline_thread)
+            thread.daemon = True
+            thread.start()
+            
+            # Update the UI when baseline update is complete
+            def check_queue():
+                try:
+                    message, data = self.queue.get(block=False)
+                    if message == "update_baseline":
+                        self._update_baseline_status()
+                        progress_window.destroy()
+                        messagebox.showinfo("Success", f"Baseline updated successfully with {data} files.")
+                    elif message == "error":
+                        progress_window.destroy()
+                        messagebox.showerror("Error", f"Error updating baseline: {data}")
+                    elif message == "close_progress":
+                        progress_window.destroy()
+                except queue.Empty:
+                    progress_window.after(100, check_queue)
+            
+            check_queue()
+    
+    def toggle_monitoring(self):
+        """Start or stop the continuous monitoring."""
+        if self.monitor_running:
+            self.monitor_running = False
+            self.monitor_btn.config(text="Start Monitoring")
+            self.monitor_status.config(text="Stopped")
+            self.next_scan.config(text="N/A")
+            logging.info("Monitoring stopped")
+        else:
+            if not self.fim.baseline:
+                messagebox.showerror("Error", "No baseline exists. Please create a baseline first.")
+                return
+            
+            try:
+                interval = int(self.scan_interval.get())
+                if interval < 10:
+                    messagebox.showerror("Error", "Scan interval must be at least 10 seconds.")
+                    return
+            except ValueError:
+                messagebox.showerror("Error", "Invalid scan interval. Please enter a number.")
+                return
+            
+            self.monitor_running = True
+            self.monitor_btn.config(text="Stop Monitoring")
+            self.monitor_status.config(text="Running")
+            self._start_monitoring_thread()
+            logging.info(f"Monitoring started with interval {interval} seconds")
+    
+    def _start_monitoring_thread(self):
+        """Start the monitoring thread."""
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            return  # Thread already running
+        
+        def monitoring_task():
+            while self.monitor_running:
+                try:
+                    interval = int(self.scan_interval.get())
+                    next_scan_time = datetime.now() + timedelta(seconds=interval)
+                    self.queue.put(("update_next_scan", next_scan_time.strftime("%Y-%m-%d %H:%M:%S")))
+                    
+                    # Check integrity
+                    changes = self.fim.check_integrity()
+                    if changes:
+                        self.queue.put(("monitoring_results", changes))
+                    
+                    # Wait for the next interval
+                    for _ in range(interval):
+                        if not self.monitor_running:
+                            break
+                        time.sleep(1)
+                except Exception as e:
+                    logging.error(f"Error in monitoring thread: {e}")
+                    self.queue.put(("monitoring_error", str(e)))
+                    break
+            
+            self.queue.put(("monitoring_stopped", None))
+        
+        self.monitor_thread = threading.Thread(target=monitoring_task)
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
+    
+    def _display_results(self, changes):
+        """Display the integrity check results in the treeview."""
+        # Clear previous results
+        for item in self.result_tree.get_children():
+            self.result_tree.delete(item)
+        
+        # Add new results
         for change in changes:
             if change["type"] == "modified":
-                logger.warning(f"MODIFIED: {change['file']}")
-                logger.warning(f"  Old hash: {change['old_hash']}")
-                logger.warning(f"  New hash: {change['new_hash']}")
+                tag = "modified"
             elif change["type"] == "deleted":
-                logger.warning(f"DELETED: {change['file']}")
+                tag = "deleted"
             elif change["type"] == "new":
-                logger.warning(f"NEW: {change['file']}")
-        
-        # Execute alert command if configured
-        alert_command = self.config.get("alert_command")
-        if alert_command:
-            try:
-                # Save changes to a temporary file
-                temp_file = "fim_changes.json"
-                with open(temp_file, 'w') as f:
-                    json.dump(changes, f, indent=4)
-                
-                # Execute alert command
-                os.system(f"{alert_command} {temp_file}")
-                
-                # Clean up
-                os.remove(temp_file)
-            except Exception as e:
-                logger.error(f"Error executing alert command: {e}")
-    
-    def update_baseline(self, file_path: Optional[str] = None) -> None:
-        """
-        Update the baseline for a specific file or all files if not specified.
-        
-        Args:
-            file_path: Path to the file to update, or None to update all files.
-        """
-        if file_path:
-            if os.path.exists(file_path) and self._should_monitor_file(file_path):
-                file_hash = self._calculate_file_hash(file_path)
-                if file_hash:
-                    self.baseline[file_path] = {
-                        "hash": file_hash,
-                        "metadata": self._get_file_metadata(file_path),
-                        "baseline_date": datetime.now().isoformat()
-                    }
-                    self._save_baseline()
-                    logger.info(f"Updated baseline for: {file_path}")
+                tag = "new"
             else:
-                logger.error(f"Cannot update baseline for {file_path}: File does not exist or is excluded")
-        else:
-            # Update baseline for all existing files
-            self.create_baseline()
+                tag = ""
+            
+            self.result_tree.insert("", tk.END, values=(change["type"], change["file"], change["timestamp"]), tags=(tag,))
+        
+        # Configure tag colors
+        self.result_tree.tag_configure("modified", foreground="orange")
+        self.result_tree.tag_configure("deleted", foreground="red")
+        self.result_tree.tag_configure("new", foreground="green")
+        
+        # Log the changes
+        if changes:
+            logging.info(f"Found {len(changes)} changes during integrity check")
+            for change in changes:
+                logging.info(f"{change['type'].upper()}: {change['file']}")
+            
+            # Execute alert command if configured
+            alert_cmd = self.fim.config.get("alert_command")
+            if alert_cmd:
+                try:
+                    os.system(alert_cmd)
+                except Exception as e:
+                    logging.error(f"Error executing alert command: {e}")
     
-    def monitor(self) -> None:
-        """Start monitoring files based on the configured interval."""
-        scan_interval = self.config.get("scan_interval", 3600)  # Default to 1 hour
+    def show_change_details(self, event):
+        """Show details of a selected change."""
+        selected_item = self.result_tree.selection()
+        if not selected_item:
+            return
         
-        if not self.baseline:
-            logger.warning("No baseline available. Creating a baseline first.")
-            self.create_baseline()
+        item = self.result_tree.item(selected_item[0])
+        change_type = item["values"][0]
+        file_path = item["values"][1]
         
-        logger.info(f"Starting monitoring with scan interval of {scan_interval} seconds")
+        # Create a details window
+        details_window = tk.Toplevel(self)
+        details_window.title(f"{change_type.capitalize()} - {os.path.basename(file_path)}")
+        details_window.geometry("500x400")
+        details_window.transient(self)
         
+        # Create a frame for the details
+        details_frame = ttk.Frame(details_window, padding="10")
+        details_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # File information
+        ttk.Label(details_frame, text="File Path:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
+        ttk.Label(details_frame, text=file_path).grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(details_frame, text="Change Type:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        ttk.Label(details_frame, text=change_type.capitalize()).grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        row = 2
+        if change_type == "modified":
+            # For modified files, show old and new hash
+            for result in self.fim.check_integrity():
+                if result["file"] == file_path and result["type"] == "modified":
+                    ttk.Label(details_frame, text="Original Hash:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+                    ttk.Label(details_frame, text=result["old_hash"]).grid(row=row, column=1, sticky=tk.W, padx=5, pady=2)
+                    row += 1
+                    
+                    ttk.Label(details_frame, text="Current Hash:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+                    ttk.Label(details_frame, text=result["new_hash"]).grid(row=row, column=1, sticky=tk.W, padx=5, pady=2)
+                    row += 1
+                    break
+        elif change_type == "new":
+            # For new files, show current hash
+            for result in self.fim.check_integrity():
+                if result["file"] == file_path and result["type"] == "new":
+                    ttk.Label(details_frame, text="Current Hash:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+                    ttk.Label(details_frame, text=result.get("hash", "N/A")).grid(row=row, column=1, sticky=tk.W, padx=5, pady=2)
+                    row += 1
+                    break
+        
+        # Add metadata
+        if change_type != "deleted" and os.path.exists(file_path):
+            ttk.Label(details_frame, text="Current Metadata:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+            row += 1
+            
+            metadata = self.fim._get_file_metadata(file_path)
+            for key, value in metadata.items():
+                if key in ["last_modified", "last_accessed"]:
+                    value = datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+                
+                ttk.Label(details_frame, text=f"{key}:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+                ttk.Label(details_frame, text=str(value)).grid(row=row, column=1, sticky=tk.W, padx=5, pady=2)
+                row += 1
+        
+        # Add actions based on change type
+        actions_frame = ttk.Frame(details_window)
+        actions_frame.pack(fill=tk.X, pady=10)
+        
+        if change_type in ["modified", "new"]:
+            ttk.Button(actions_frame, text="Update Baseline for this File", 
+                       command=lambda: self._update_baseline_for_file(file_path, details_window)).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(actions_frame, text="Close", command=details_window.destroy).pack(side=tk.RIGHT, padx=5)
+    
+    def _update_baseline_for_file(self, file_path, details_window=None):
+        """Update the baseline for a specific file."""
+        if os.path.exists(file_path):
+            self.fim.update_baseline(file_path)
+            messagebox.showinfo("Success", f"Baseline updated for {os.path.basename(file_path)}")
+            if details_window:
+                details_window.destroy()
+        else:
+            messagebox.showerror("Error", f"File {os.path.basename(file_path)} does not exist.")
+    
+    def add_monitored_path(self):
+        """Add a path to the monitored paths list."""
+        path = filedialog.askdirectory()
+        if path:
+            if path not in self.fim.config.get("monitored_paths", []):
+                self.paths_listbox.insert(tk.END, path)
+            else:
+                messagebox.showinfo("Information", "This path is already being monitored.")
+    
+    def remove_monitored_path(self):
+        """Remove a path from the monitored paths list."""
+        selected = self.paths_listbox.curselection()
+        if selected:
+            self.paths_listbox.delete(selected)
+    
+    def add_excluded_path(self):
+        """Add a path to the excluded paths list."""
+        path = filedialog.askdirectory()
+        if path:
+            if path not in self.fim.config.get("excluded_paths", []):
+                self.excluded_paths_listbox.insert(tk.END, path)
+            else:
+                messagebox.showinfo("Information", "This path is already excluded.")
+    
+    def remove_excluded_path(self):
+        """Remove a path from the excluded paths list."""
+        selected = self.excluded_paths_listbox.curselection()
+        if selected:
+            self.excluded_paths_listbox.delete(selected)
+    
+    def add_excluded_extension(self):
+        """Add an extension to the excluded extensions list."""
+        extension = self.extension_entry.get()
+        if extension:
+            if not extension.startswith('.'):
+                extension = '.' + extension
+            
+            if extension not in self.fim.config.get("excluded_extensions", []):
+                self.excluded_extensions_listbox.insert(tk.END, extension)
+                self.extension_entry.delete(0, tk.END)
+            else:
+                messagebox.showinfo("Information", "This extension is already excluded.")
+    
+    def remove_excluded_extension(self):
+        """Remove an extension from the excluded extensions list."""
+        selected = self.excluded_extensions_listbox.curselection()
+        if selected:
+            self.excluded_extensions_listbox.delete(selected)
+    
+    def save_configuration(self):
+        """Save the configuration to the config file."""
+        try:
+            # Update the configuration with values from the UI
+            self.fim.config["hash_algorithm"] = self.hash_algorithm.get()
+            
+            try:
+                self.fim.config["scan_interval"] = int(self.scan_interval.get())
+            except ValueError:
+                messagebox.showerror("Error", "Scan interval must be a number.")
+                return
+            
+            self.fim.config["baseline_file"] = self.baseline_file.get()
+            self.fim.config["alert_command"] = self.alert_command.get()
+            
+            # Update monitored paths
+            monitored_paths = list(self.paths_listbox.get(0, tk.END))
+            self.fim.config["monitored_paths"] = monitored_paths
+            
+            # Update excluded paths
+            excluded_paths = list(self.excluded_paths_listbox.get(0, tk.END))
+            self.fim.config["excluded_paths"] = excluded_paths
+            
+            # Update excluded extensions
+            excluded_extensions = list(self.excluded_extensions_listbox.get(0, tk.END))
+            self.fim.config["excluded_extensions"] = excluded_extensions
+            
+            # Save to the config file
+            with open(self.fim.config_file, 'w') as f:
+                json.dump(self.fim.config, f, indent=4)
+            
+            # Update the scan interval label
+            self.scan_interval_label.config(text=f"{self.fim.config.get('scan_interval', 3600)} seconds")
+            
+            messagebox.showinfo("Success", "Configuration saved successfully.")
+            logging.info("Configuration saved")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error saving configuration: {e}")
+            logging.error(f"Error saving configuration: {e}")
+    
+    def clear_logs(self):
+        """Clear the log display area."""
+        self.log_text.configure(state="normal")
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.configure(state="disabled")
+    
+    def refresh_logs(self):
+        """Refresh the log display area with the latest logs."""
+        # Clear existing logs
+        self.log_text.configure(state="normal")
+        self.log_text.delete(1.0, tk.END)
+        
+        # Read the log file
+        try:
+            if os.path.exists("fim_gui.log"):
+                with open("fim_gui.log", 'r') as f:
+                    logs = f.read()
+                    self.log_text.insert(tk.END, logs)
+        except Exception as e:
+            self.log_text.insert(tk.END, f"Error reading log file: {e}")
+        
+        self.log_text.configure(state="disabled")
+        
+        # Scroll to the end
+        self.log_text.see(tk.END)
+    
+    def process_queue(self):
+        """Process messages from the queue."""
         try:
             while True:
-                logger.info("Performing integrity check...")
-                changes = self.check_integrity()
-                self.handle_changes(changes)
+                message, data = self.queue.get(block=False)
                 
-                logger.info(f"Next scan in {scan_interval} seconds")
-                time.sleep(scan_interval)
-        except KeyboardInterrupt:
-            logger.info("Monitoring stopped by user")
-        except Exception as e:
-            logger.error(f"Error during monitoring: {e}")
+                if message == "update_baseline":
+                    self._update_baseline_status()
+                elif message == "update_results":
+                    self._display_results(data)
+                    self.last_check_time = datetime.now()
+                    self.last_check.config(text=self.last_check_time.strftime("%Y-%m-%d %H:%M:%S"))
+                elif message == "monitoring_results":
+                    self._display_results(data)
+                    self.last_check_time = datetime.now()
+                    self.last_check.config(text=self.last_check_time.strftime("%Y-%m-%d %H:%M:%S"))
+                    
+                    # Show notification
+                    messagebox.showinfo("Integrity Alert", f"Found {len(data)} changes during automated monitoring.")
+                elif message == "update_next_scan":
+                    self.next_scan.config(text=data)
+                elif message == "monitoring_error":
+                    messagebox.showerror("Monitoring Error", f"Error during monitoring: {data}")
+                    self.monitor_running = False
+                    self.monitor_btn.config(text="Start Monitoring")
+                    self.monitor_status.config(text="Stopped")
+                elif message == "monitoring_stopped":
+                    self.monitor_status.config(text="Stopped")
+        except queue.Empty:
+            pass
+        
+        # Schedule next check
+        self.after(100, self.process_queue)
+
 
 def main():
-    """Main function to run the File Integrity Monitor."""
-    parser = argparse.ArgumentParser(description="File Integrity Monitor")
-    parser.add_argument("--config", "-c", help="Path to configuration file", default="fim_config.json")
-    
-    subparsers = parser.add_subparsers(dest="command", help="Command to run")
-    
-    # Create baseline command
-    subparsers.add_parser("create-baseline", help="Create a new baseline of file hashes")
-    
-    # Check integrity command
-    subparsers.add_parser("check", help="Check file integrity against the baseline")
-    
-    # Update baseline command
-    update_parser = subparsers.add_parser("update", help="Update the baseline for a specific file or all files")
-    update_parser.add_argument("--file", "-f", help="Path to the file to update (optional)")
-    
-    # Monitor command
-    subparsers.add_parser("monitor", help="Start monitoring files continuously")
-    
-    args = parser.parse_args()
-    
-    fim = FileIntegrityMonitor(args.config)
-    
-    if args.command == "create-baseline":
-        fim.create_baseline()
-    elif args.command == "check":
-        changes = fim.check_integrity()
-        fim.handle_changes(changes)
-    elif args.command == "update":
-        fim.update_baseline(args.file)
-    elif args.command == "monitor":
-        fim.monitor()
-    else:
-        parser.print_help()
+    """Main entry point for the application."""
+    app = FIMApplication()
+    app.mainloop()
+
 
 if __name__ == "__main__":
     main()
